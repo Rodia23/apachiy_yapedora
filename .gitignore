@@ -1,0 +1,19 @@
+# Archivos generados / temporales
+build/
+temp_fotos/
+recibos_descargados/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.spec
+*.log
+
+# Entornos virtuales
+venv/
+.env
+.venv/
+
+# IDE
+.vscode/
+.idea/
