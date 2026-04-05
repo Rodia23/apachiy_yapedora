@@ -2,8 +2,6 @@ import subprocess, time, os, re, csv, sys, threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime, timedelta
-from PIL import Image, ImageEnhance
-import pytesseract
 import xml.etree.ElementTree as ET
 
 # ==========================================
@@ -20,12 +18,19 @@ else:
     TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ESCRITORIO_DIR = os.path.join(os.path.expanduser("~"), "Desktop")
-RUTA_CSV = os.path.join(ESCRITORIO_DIR, "Reporte_Yape_Ninja.csv")
 
-ADB_EXE  = os.path.join(TOOLS_DIR, "tools", "adb", "adb.exe")
-TESS_EXE = os.path.join(TOOLS_DIR, "tools", "Tesseract-OCR", "tesseract.exe")
-os.environ['TESSDATA_PREFIX'] = os.path.join(TOOLS_DIR, "tools", "Tesseract-OCR", "tessdata")
-pytesseract.pytesseract.tesseract_cmd = TESS_EXE
+def get_ruta_csv(nombre_base):
+    """Devuelve la ruta final del CSV, añadiendo (1), (2)… si ya existe."""
+    base = os.path.join(ESCRITORIO_DIR, nombre_base)
+    ruta = base + ".csv"
+    if not os.path.exists(ruta):
+        return ruta
+    i = 1
+    while os.path.exists(f"{base} ({i}).csv"):
+        i += 1
+    return f"{base} ({i}).csv"
+
+ADB_EXE = os.path.join(TOOLS_DIR, "tools", "adb", "adb.exe")
 
 # Delays configurables (segundos) — ajusta según la velocidad de tu dispositivo
 DELAY_ABRIR_DETALLE = 2.5
@@ -36,22 +41,19 @@ DELAY_SCROLL        = 2.0
 # 2. CEREBRO DEL BOT
 # ==========================================
 class YapeBotPro:
-    def __init__(self, fecha_inicio, fecha_fin, filtro_tipo):
+    def __init__(self, fecha_inicio, fecha_fin, filtro_tipo, ruta_csv):
         self.f_inicio    = fecha_inicio
         self.f_fin       = fecha_fin
         self.filtro_tipo = filtro_tipo
+        self.ruta_csv    = ruta_csv
         self.temp_pc     = os.path.join(RUN_DIR, "temp_fotos")
         os.makedirs(self.temp_pc, exist_ok=True)
         self.vistos  = set()
         self.abortar = False
 
-        # Regex compiladas una sola vez (mejor performance en loops largos)
-        self._re_fecha   = re.compile(r"(\d+)\s+(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)")
-        self._re_hora    = re.compile(r"(\d{1,2}:\d{2}\s*[ap]\.?\s*m\.?)")
-        self._re_op      = re.compile(r"operaci[oó]n.*?(\d{7,11})")
-        self._re_op_alt  = re.compile(r"\b\d{8,10}\b")
-        self._re_cel     = re.compile(r"(?:celular|destino).*?(\d{3})\b")
-        self._re_cel_alt = re.compile(r"[\*\.\- ]+(\d{3})$", re.MULTILINE)
+        # Regex compiladas una sola vez
+        self._re_fecha = re.compile(r"(\d+)\s+(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)")
+        self._re_hora  = re.compile(r"(\d{1,2}:\d{2}\s*[ap]\.?\s*m\.?)")
 
         res = self.adb("shell", "wm", "size")
         m   = re.search(r"(\d+)x(\d+)", res)
@@ -89,6 +91,47 @@ class YapeBotPro:
                 fecha = fecha.replace(year=year - 1)
             return fecha
         return None
+
+    def _extraer_check_xml(self, ruta_check):
+        """Lee el XML del detalle y extrae cel, op y hora directamente. Sin OCR."""
+        try:
+            root = ET.parse(ruta_check).getroot()
+        except (ET.ParseError, FileNotFoundError, OSError):
+            return None
+
+        textos = [n.attrib.get('text', '').strip()
+                  for n in root.iter('node')
+                  if n.attrib.get('text', '').strip()]
+
+        # Verificar que sea la pantalla de detalle correcta
+        contenido = ' '.join(textos).lower()
+        if 'operaci' not in contenido and 'compartir' not in contenido:
+            return None
+
+        def siguiente(label):
+            for i, t in enumerate(textos):
+                if label.lower() in t.lower() and i + 1 < len(textos):
+                    return textos[i + 1]
+            return None
+
+        # Celular: "*** *** 619" → últimos 3 dígitos
+        cel_raw = siguiente('celular')
+        if cel_raw:
+            m = re.search(r'(\d{3})\s*$', cel_raw)
+            cel = m.group(1) if m else '---'
+        else:
+            cel = '---'
+
+        # Operación: nodo siguiente a "operaci"
+        op_raw = siguiente('operaci')
+        op = op_raw.strip() if op_raw and re.match(r'\d{5,}', op_raw.strip()) else '???'
+
+        # Hora: primer nodo que tenga formato hora (ej: "03:38 p. m.")
+        hora_txt = next(
+            (t for t in textos if re.match(r'\d{1,2}:\d{2}\s*[ap]', t.lower())), None
+        )
+
+        return {'cel': cel, 'op': op, 'hora_txt': hora_txt}
 
     def ejecutar(self, progreso_callback):
         progreso_callback("🚀 Iniciando búsqueda inteligente...")
@@ -148,29 +191,40 @@ class YapeBotPro:
                         time.sleep(DELAY_ABRIR_DETALLE)
 
                         self._descargar_xml("check.xml", ruta_check)
-                        with open(ruta_check, encoding='utf-8') as f:
-                            con_compartir = "Compartir" in f.read()
+                        datos = self._extraer_check_xml(ruta_check)
 
-                        if con_compartir:
-                            n_f = f"rec_{int(time.time())}.png"
-                            p_f = os.path.join(self.temp_pc, n_f)
-                            self.adb("shell", "screencap", "-p", f"/sdcard/{n_f}")
-                            self.adb("pull", f"/sdcard/{n_f}", p_f)
-                            self.adb("shell", "rm", f"/sdcard/{n_f}")
-
-                            resp = {
-                                "n": nombre,
-                                "m": monto_raw.replace('S/', '').replace('-', '').strip(),
-                                "t": "EGRESO" if es_egreso else "INGRESO",
-                                "f_raw": txt,
-                            }
-                            coleccion.append((p_f, resp))
-
-                            progreso_callback("🔙 Volviendo a la lista...")
+                        if datos is None:
+                            progreso_callback("⚠️ No abrió el detalle. Saltando...")
                             self.adb("shell", "input", "keyevent", "4")
                             time.sleep(DELAY_VOLVER_LISTA)
+                            continue
+
+                        # Hora: preferimos la del check.xml (más precisa), fallback a f_raw
+                        hora_src = datos['hora_txt'] or txt
+                        h_m = self._re_hora.search(hora_src.lower())
+                        if h_m:
+                            raw_h = re.sub(r'\s+', '', h_m.group(1).lower().replace('.', ''))
+                            try:
+                                hora_clean = datetime.strptime(raw_h, "%I:%M%p").strftime("%H:%M h")
+                            except ValueError:
+                                hora_clean = h_m.group(1).strip()
                         else:
-                            progreso_callback("⚠️ No abrió el detalle. Saltando...")
+                            hora_clean = "--:--"
+
+                        f_obj = self.traducir_yape_fecha(txt)
+                        coleccion.append({
+                            'tipo':     "EGRESO" if es_egreso else "INGRESO",
+                            'fecha':    f_obj.strftime("%d/%m/%Y") if f_obj else txt,
+                            'hora':     hora_clean,
+                            'contacto': nombre,
+                            'monto':    monto_raw.replace('S/', '').replace('-', '').strip(),
+                            'cel':      datos['cel'],
+                            'op':       datos['op'],
+                        })
+
+                        progreso_callback("🔙 Volviendo a la lista...")
+                        self.adb("shell", "input", "keyevent", "4")
+                        time.sleep(DELAY_VOLVER_LISTA)
 
                     elif f_obj_pura < inicio_puro:
                         intentos_vacios = 99
@@ -191,36 +245,15 @@ class YapeBotPro:
         return self.procesar_final(coleccion, progreso_callback)
 
     def procesar_final(self, col, callback):
-        header = not os.path.exists(RUTA_CSV)
-        with open(RUTA_CSV, 'a', newline='', encoding='utf-8') as f:
+        header = not os.path.exists(self.ruta_csv)
+        with open(self.ruta_csv, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             if header:
                 writer.writerow(['Tipo', 'Fecha', 'Hora', 'Contacto', 'Monto', 'Cel', 'Op'])
-            for p, r in col:
-                callback(f"🧠 Procesando {r['n']}...")
-
-                f_obj      = self.traducir_yape_fecha(r['f_raw'])
-                fecha_clean = f_obj.strftime("%d/%m/%Y") if f_obj else r['f_raw']
-                h_m        = self._re_hora.search(r['f_raw'].lower())
-                hora_clean  = h_m.group(1).upper().replace(".", "") if h_m else "--:--"
-
-                img = Image.open(p).convert('L')
-                img = img.resize((img.width * 2, img.height * 2), Image.Resampling.LANCZOS)
-                img = ImageEnhance.Contrast(img).enhance(2.0)
-
-                txt_ocr = pytesseract.image_to_string(img, config='--psm 6').lower()
-
-                c_m = self._re_cel.search(txt_ocr)
-                if not c_m: c_m = self._re_cel_alt.search(txt_ocr)
-                cel = c_m.group(1) if c_m else "---"
-
-                op_m = self._re_op.search(txt_ocr)
-                if not op_m: op_m = self._re_op_alt.search(txt_ocr)
-                op = (op_m.group(1) if op_m and op_m.lastindex else
-                      op_m.group(0) if op_m else "???")
-
-                writer.writerow([r['t'], fecha_clean, hora_clean, r['n'], r['m'], cel, op])
-                os.remove(p)
+            for r in col:
+                callback(f"✅ {r['contacto']} — S/{r['monto']} — cel:{r['cel']} — op:{r['op']}")
+                writer.writerow([r['tipo'], r['fecha'], r['hora'],
+                                 r['contacto'], r['monto'], r['cel'], r['op']])
         return True
 
 # ==========================================
@@ -288,11 +321,20 @@ class AppNinja:
         )
         self.lbl_modelo.pack(pady=(5, 0), fill="x")
 
-        btn_ayuda = tk.Button(main_frame, text="¿Problemas de conexión? Ver guía de configuración",
+        equipo_row = tk.Frame(main_frame, bg=self.COLOR_BG)
+        equipo_row.pack(fill="x", pady=(3, 0))
+        btn_ayuda = tk.Button(equipo_row, text="¿Problemas de conexión? Ver guía",
                               command=self.mostrar_ayuda_celular, bg=self.COLOR_BG,
                               fg=self.COLOR_MORADO, font=("Segoe UI", 8, "underline"),
                               bd=0, cursor="hand2", activebackground=self.COLOR_BG)
-        btn_ayuda.pack(pady=(3, 15))
+        btn_ayuda.pack(side="left")
+        btn_refresh = tk.Button(equipo_row, text="🔄 Actualizar",
+                                command=self.actualizar_estado_celular, bg=self.COLOR_BG,
+                                fg="#374151", font=("Segoe UI", 8),
+                                bd=1, relief="solid", cursor="hand2",
+                                activebackground="#E5E7EB")
+        btn_refresh.pack(side="right")
+        tk.Frame(main_frame, bg=self.COLOR_BG, height=12).pack()
 
         # Rango + Tipo en fila
         config_frame = tk.Frame(main_frame, bg=self.COLOR_BG)
@@ -305,7 +347,8 @@ class AppNinja:
         mes_act = datetime.now().strftime("%B").capitalize()
         self.combo_rango = ttk.Combobox(
             range_subframe, textvariable=self.rango_var, state="readonly",
-            values=["Día Específico", "Hoy", "Ayer", "Últimos 3 días", "Esta Semana", f"Todo {mes_act}"]
+            values=["Día Específico", "Mes Específico", "Hoy", "Ayer",
+                    "Últimos 3 días", "Esta Semana", f"Todo {mes_act}"]
         )
         self.combo_rango.pack(pady=5, fill="x")
         self.combo_rango.bind("<<ComboboxSelected>>", self.toggle_fecha_manual)
@@ -325,6 +368,16 @@ class AppNinja:
         ttk.Entry(self.frame_fecha, textvariable=self.fecha_manual_var, width=15).pack(side="left", padx=5)
         self.lbl_hint = tk.Label(main_frame, text="(Formato: DD/MM/AAAA)",
                                  bg=self.COLOR_BG, fg="gray", font=("Segoe UI", 7))
+
+        # Selector de mes (oculto por defecto)
+        MESES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio",
+                 "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
+        self.frame_mes = tk.Frame(main_frame, bg=self.COLOR_BG)
+        tk.Label(self.frame_mes, text="Mes:", bg=self.COLOR_BG,
+                 fg=self.COLOR_TEXTO, font=("Segoe UI", 9)).pack(side="left")
+        self.mes_var = tk.StringVar(value=MESES[datetime.now().month - 1])
+        ttk.Combobox(self.frame_mes, textvariable=self.mes_var,
+                     values=MESES, state="readonly", width=14).pack(side="left", padx=5)
 
         # Bitácora
         log_frame = ttk.LabelFrame(main_frame, text=" 📜 BITÁCORA DE OPERACIONES ", style="Bitacora.TLabelframe")
@@ -353,6 +406,7 @@ class AppNinja:
                    cursor="hand2").pack(side="bottom", fill="x", pady=(0, 10))
 
         self.bot_instancia = None
+        self.ultimo_csv    = None
 
     # --- HELPERS ---
     def crear_label(self, contenedor, texto):
@@ -360,12 +414,15 @@ class AppNinja:
                  font=("Segoe UI", 8, "bold"), anchor="w").pack(pady=(0, 0), fill="x")
 
     def toggle_fecha_manual(self, event=None):
-        if self.rango_var.get() == "Día Específico":
+        r = self.rango_var.get()
+        self.frame_fecha.pack_forget()
+        self.lbl_hint.pack_forget()
+        self.frame_mes.pack_forget()
+        if r == "Día Específico":
             self.frame_fecha.pack(pady=5, anchor="w")
             self.lbl_hint.pack(anchor="w", padx=100)
-        else:
-            self.frame_fecha.pack_forget()
-            self.lbl_hint.pack_forget()
+        elif r == "Mes Específico":
+            self.frame_mes.pack(pady=5, anchor="w")
 
     def log(self, msg):
         self.log_text.config(state="normal")
@@ -374,7 +431,26 @@ class AppNinja:
         self.log_text.config(state="disabled")
         self.root.update_idletasks()
 
+    def actualizar_estado_celular(self):
+        modelo = subprocess.run(
+            [ADB_EXE, "shell", "getprop", "ro.product.model"],
+            capture_output=True, text=True
+        ).stdout.strip()
+        self.lbl_modelo.config(text=modelo if modelo else "ESPERANDO CONEXIÓN...")
+
     def arrancar_hilo(self):
+        modelo = subprocess.run(
+            [ADB_EXE, "shell", "getprop", "ro.product.model"],
+            capture_output=True, text=True
+        ).stdout.strip()
+        if not modelo:
+            messagebox.showerror(
+                "Sin conexión",
+                "No se detectó ningún dispositivo.\n\n"
+                "Conecta tu celular por USB y activa la Depuración USB,\n"
+                "luego presiona 🔄 Actualizar."
+            )
+            return
         self.log_text.config(state="normal")
         self.log_text.delete('1.0', tk.END)
         self.log_text.config(state="disabled")
@@ -387,20 +463,48 @@ class AppNinja:
         r     = self.rango_var.get()
         f_fin = hoy
         try:
+            MESES_NUM = {"Enero":1,"Febrero":2,"Marzo":3,"Abril":4,"Mayo":5,"Junio":6,
+                         "Julio":7,"Agosto":8,"Septiembre":9,"Octubre":10,"Noviembre":11,"Diciembre":12}
             if r == "Día Específico":
                 f_inicio = datetime.strptime(self.fecha_manual_var.get().strip(), "%d/%m/%Y")
                 f_fin    = f_inicio
-            elif "Hoy"    in r: f_inicio = hoy
-            elif "Ayer"   in r: f_inicio = hoy - timedelta(days=1)
-            elif "3 días" in r: f_inicio = hoy - timedelta(days=3)
-            elif "Semana" in r: f_inicio = hoy - timedelta(days=7)
-            else:               f_inicio = hoy.replace(day=1)
+                nombre_base = f"Reporte_Yape_{f_inicio.strftime('%d-%m-%Y')}"
+            elif r == "Mes Específico":
+                mes_nom  = self.mes_var.get()
+                mes_num  = MESES_NUM[mes_nom]
+                year     = hoy.year
+                f_inicio = datetime(year, mes_num, 1)
+                # Último día del mes
+                if mes_num == 12:
+                    f_fin = datetime(year, 12, 31)
+                else:
+                    f_fin = datetime(year, mes_num + 1, 1) - timedelta(days=1)
+                nombre_base = f"Reporte_Yape_{mes_nom}-{year}"
+            elif "Hoy" in r:
+                f_inicio    = hoy
+                nombre_base = f"Reporte_Yape_Hoy_{hoy.strftime('%d-%m-%Y')}"
+            elif "Ayer" in r:
+                f_inicio    = hoy - timedelta(days=1)
+                nombre_base = f"Reporte_Yape_Ayer_{f_inicio.strftime('%d-%m-%Y')}"
+            elif "3 días" in r:
+                f_inicio    = hoy - timedelta(days=3)
+                nombre_base = f"Reporte_Yape_3dias_{f_inicio.strftime('%d-%m-%Y')}_al_{hoy.strftime('%d-%m-%Y')}"
+            elif "Semana" in r:
+                f_inicio    = hoy - timedelta(days=7)
+                nombre_base = f"Reporte_Yape_Semana_{f_inicio.strftime('%d-%m-%Y')}_al_{hoy.strftime('%d-%m-%Y')}"
+            else:
+                f_inicio    = hoy.replace(day=1)
+                nombre_base = f"Reporte_Yape_{hoy.strftime('%B-%Y').capitalize()}"
+
+            ruta_csv = get_ruta_csv(nombre_base)
+            self.log(f"📄 Guardando en: {os.path.basename(ruta_csv)}")
 
             t = {"Ingresos": 1, "Egresos": 2, "Todos": 3}[self.tipo_var.get()]
-            self.bot_instancia = YapeBotPro(f_inicio, f_fin, t)
+            self.bot_instancia  = YapeBotPro(f_inicio, f_fin, t, ruta_csv)
+            self.ultimo_csv     = ruta_csv
             if self.bot_instancia.ejecutar(self.log):
                 if not self.bot_instancia.abortar:
-                    messagebox.showinfo("Éxito", "¡Misión terminada con éxito! 🎉\nEl reporte te espera en el Escritorio.")
+                    messagebox.showinfo("Éxito", f"¡Misión terminada con éxito! 🎉\nReporte guardado en el Escritorio:\n{os.path.basename(ruta_csv)}")
         except ValueError as e:
             messagebox.showerror("Error de fecha", f"Formato incorrecto. Usa DD/MM/AAAA.\nDetalle: {e}")
         except Exception as e:
@@ -426,8 +530,20 @@ class AppNinja:
         messagebox.showinfo("Guía de Configuración USB", instrucciones)
 
     def abrir_csv(self):
-        if os.path.exists(RUTA_CSV):
-            os.startfile(RUTA_CSV)
+        ruta = self.ultimo_csv
+        if ruta and os.path.exists(ruta):
+            os.startfile(ruta)
+        else:
+            # Si aún no se ha generado nada en esta sesión, buscar el más reciente del escritorio
+            archivos = [
+                os.path.join(ESCRITORIO_DIR, f)
+                for f in os.listdir(ESCRITORIO_DIR)
+                if f.startswith("Reporte_Yape_") and f.endswith(".csv")
+            ]
+            if archivos:
+                os.startfile(max(archivos, key=os.path.getmtime))
+            else:
+                messagebox.showinfo("Sin reporte", "Todavía no se ha generado ningún reporte.")
 
     def cerrar_aplicacion(self):
         if self.bot_instancia:
