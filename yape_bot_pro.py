@@ -150,6 +150,14 @@ class YapeBotPro:
                 break
 
             nodos = list(root.iter('node'))
+
+            # Verificar que seguimos en la pantalla de Movimientos
+            if not any('Movimientos' in n.attrib.get('text', '') for n in nodos):
+                progreso_callback("📱 Fuera de Movimientos, volviendo...")
+                self.adb("shell", "input", "keyevent", "4")
+                time.sleep(1.5)
+                continue
+
             encontrados_en_vista = 0
 
             for i, node in enumerate(nodos):
@@ -194,7 +202,8 @@ class YapeBotPro:
                         datos = self._extraer_check_xml(ruta_check)
 
                         if datos is None:
-                            progreso_callback("⚠️ No abrió el detalle. Saltando...")
+                            progreso_callback(f"⚠️ No abrió el detalle de {nombre}. Se reintentará.")
+                            self.vistos.discard(id_u)
                             self.adb("shell", "input", "keyevent", "4")
                             time.sleep(DELAY_VOLVER_LISTA)
                             continue
