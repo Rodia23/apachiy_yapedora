@@ -214,7 +214,15 @@ class YapeBotPro:
                         if i == 0 or i >= len(nodos) - 1:
                             continue
 
-                        nombre    = nodos[i - 1].attrib.get('text', 'Desc')
+                        # Buscar el nombre hacia atrás: ignorar nodos vacíos o de monto
+                        nombre = ''
+                        for j in range(i - 1, max(i - 6, -1), -1):
+                            t = nodos[j].attrib.get('text', '').strip()
+                            if t and not t.startswith('S/'):
+                                nombre = t
+                                break
+                        if not nombre:
+                            nombre = 'Desc'
                         monto_raw = nodos[i + 1].attrib.get('text', '0')
                         es_egreso = "-" in monto_raw
 
@@ -295,10 +303,16 @@ class YapeBotPro:
             writer = csv.writer(f)
             if header:
                 writer.writerow(['Tipo', 'Fecha', 'Hora', 'Contacto', 'Monto', 'Cel', 'Op'])
+            seen_ops = set()
             for r in col:
+                if r['op'] in seen_ops:
+                    callback(f"⚠️ Op duplicada {r['op']} omitida")
+                    continue
+                seen_ops.add(r['op'])
                 callback(f"✅ {r['contacto']} — S/{r['monto']} — cel:{r['cel']} — op:{r['op']}")
+                # op con ="..." para que Excel no elimine ceros iniciales
                 writer.writerow([r['tipo'], r['fecha'], r['hora'],
-                                 r['contacto'], r['monto'], r['cel'], r['op']])
+                                 r['contacto'], r['monto'], r['cel'], f'="{r["op"]}"'])
         return True
 
 # ==========================================
