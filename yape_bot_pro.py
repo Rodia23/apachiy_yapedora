@@ -32,10 +32,10 @@ def get_ruta_csv(nombre_base):
 
 ADB_EXE = os.path.join(TOOLS_DIR, "tools", "adb", "adb.exe")
 
-# Delays configurables (segundos) — ajusta según la velocidad de tu dispositivo
-DELAY_ABRIR_DETALLE = 2.5
-DELAY_VOLVER_LISTA  = 1.8
-DELAY_SCROLL        = 2.0
+# Delays configurables (segundos)
+DELAY_SCROLL    = 2.0   # espera tras scroll (la lista necesita tiempo para re-renderizar)
+POLL_INTERVALO  = 0.5   # cada cuánto se reintenta en los polls
+POLL_MAX_SEG    = 6     # timeout máximo de espera por pantalla
 
 # ==========================================
 # 2. CEREBRO DEL BOT
@@ -91,6 +91,45 @@ class YapeBotPro:
                 fecha = fecha.replace(year=year - 1)
             return fecha
         return None
+
+    def _esperar_detalle(self, ruta_check):
+        """Descarga check.xml cada POLL_INTERVALO hasta que el detalle cargue o se agote el timeout."""
+        for _ in range(int(POLL_MAX_SEG / POLL_INTERVALO)):
+            time.sleep(POLL_INTERVALO)
+            self._descargar_xml("check.xml", ruta_check)
+            datos = self._extraer_check_xml(ruta_check)
+            if datos:
+                return datos
+        return None
+
+    def _tap_cerrar(self, ruta_check):
+        """Toca el botón X (content-desc=Cerrar) del detalle. Fallback: tecla Back."""
+        try:
+            root = ET.parse(ruta_check).getroot()
+            for n in root.iter('node'):
+                if 'cerrar' in n.attrib.get('content-desc', '').lower():
+                    coords = list(map(int, re.findall(r'\d+', n.attrib.get('bounds', ''))))
+                    if len(coords) >= 4:
+                        cx = str((coords[0] + coords[2]) // 2)
+                        cy = str((coords[1] + coords[3]) // 2)
+                        self.adb("shell", "input", "tap", cx, cy)
+                        return
+        except (ET.ParseError, FileNotFoundError, OSError):
+            pass
+        self.adb("shell", "input", "keyevent", "4")  # fallback
+
+    def _esperar_movimientos(self, ruta_view):
+        """Descarga view.xml cada POLL_INTERVALO hasta confirmar que estamos en Movimientos."""
+        for _ in range(int(POLL_MAX_SEG / POLL_INTERVALO)):
+            time.sleep(POLL_INTERVALO)
+            self._descargar_xml("view.xml", ruta_view)
+            try:
+                root = ET.parse(ruta_view).getroot()
+                if any('Movimientos' in n.attrib.get('text', '') for n in root.iter('node')):
+                    return True
+            except (ET.ParseError, FileNotFoundError, OSError):
+                pass
+        return False
 
     def _extraer_check_xml(self, ruta_check):
         """Lee el XML del detalle y extrae cel, op y hora directamente. Sin OCR."""
@@ -198,14 +237,13 @@ class YapeBotPro:
                             self.adb("shell", "input", "tap", cx, cy)
                         time.sleep(DELAY_ABRIR_DETALLE)
 
-                        self._descargar_xml("check.xml", ruta_check)
-                        datos = self._extraer_check_xml(ruta_check)
+                        datos = self._esperar_detalle(ruta_check)
 
                         if datos is None:
                             progreso_callback(f"⚠️ No abrió el detalle de {nombre}. Se reintentará.")
                             self.vistos.discard(id_u)
-                            self.adb("shell", "input", "keyevent", "4")
-                            time.sleep(DELAY_VOLVER_LISTA)
+                            self._tap_cerrar(ruta_check)
+                            self._esperar_movimientos(ruta_view)
                             continue
 
                         # Hora: preferimos la del check.xml (más precisa), fallback a f_raw
@@ -232,8 +270,8 @@ class YapeBotPro:
                         })
 
                         progreso_callback("🔙 Volviendo a la lista...")
-                        self.adb("shell", "input", "keyevent", "4")
-                        time.sleep(DELAY_VOLVER_LISTA)
+                        self._tap_cerrar(ruta_check)
+                        self._esperar_movimientos(ruta_view)
 
                     elif f_obj_pura < inicio_puro:
                         intentos_vacios = 99
