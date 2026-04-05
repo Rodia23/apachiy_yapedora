@@ -235,8 +235,6 @@ class YapeBotPro:
                             cx = str((coords[0] + coords[2]) // 2)
                             cy = str((coords[1] + coords[3]) // 2)
                             self.adb("shell", "input", "tap", cx, cy)
-                        time.sleep(DELAY_ABRIR_DETALLE)
-
                         datos = self._esperar_detalle(ruta_check)
 
                         if datos is None:
