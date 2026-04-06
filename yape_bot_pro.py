@@ -310,8 +310,8 @@ class YapeBotPro:
                     continue
                 seen_ops.add(r['op'])
                 callback(f"✅ {r['contacto']} — S/{r['monto']} — cel:{r['cel']} — op:{r['op']}")
-                # op con ="..." para que Excel no elimine ceros iniciales
-                writer.writerow([r['tipo'], r['fecha'], r['hora'],
+                # ="..." en fecha, hora y op → Excel los trata como texto, no reformatea
+                writer.writerow([r['tipo'], f'="{r["fecha"]}"', f'="{r["hora"]}"',
                                  r['contacto'], r['monto'], r['cel'], f'="{r["op"]}"'])
         return True
 
